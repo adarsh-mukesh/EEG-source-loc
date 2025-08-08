@@ -1,0 +1,89 @@
+import sys
+import os
+from anlffr.helper import biosemi2mne as bs
+from anlffr.preproc import find_blinks
+from mne import compute_proj_epochs
+import numpy as np
+import mne
+from scipy.io import savemat
+import fnmatch
+from mne.datasets import eegbci, fetch_fsaverage
+import matplotlib.pyplot as plt
+
+f1='C:/Users/amukesh/Downloads/ABR_human'
+os.chdir(f1)
+fl=os.listdir(f1)
+bdfs=fnmatch.filter(fl,'*.bdf')
+bdfs = fnmatch.filter(os.listdir(),'*.bdf')
+ss=[sum([ord(char) for char in string]) for string in bdfs]
+kp=(np.argsort(ss)).tolist()
+bdfs=[bdfs[ii] for ii in kp]
+rawlist=[]
+eveslist=[]
+for rawname in bdfs:
+    rawtemp,evestemp = bs.importbdf(rawname, verbose='DEBUG',refchans=['EXG1', 'EXG2'])
+    rawlist += [rawtemp, ]
+    eveslist += [evestemp, ]
+raw, eves = mne.concatenate_raws(rawlist, events_list=eveslist)
+
+fs_dir = fetch_fsaverage(verbose=True)
+subjects_dir = os.path.dirname(fs_dir)
+subject = "fsaverage"
+trans = "fsaverage"  # MNE has a built-in fsaverage transformation
+src = os.path.join(fs_dir, "bem", "fsaverage-ico-5-src.fif")
+bem = os.path.join(fs_dir, "bem", "fsaverage-5120-5120-5120-bem-sol.fif")
+mri= os.path.join(fs_dir, "mri", "aseg.mgz")
+montage = mne.channels.make_standard_montage("biosemi32")
+raw.set_eeg_reference(projection=True)
+mdc = dict(zip(raw.ch_names,montage.ch_names))
+raw.rename_channels(mdc)
+raw.set_montage(montage,on_missing='ignore')
+raw.pick_channels(montage.ch_names)
+
+surf_src=mne.setup_source_space(subject, spacing='oct5', subjects_dir=subjects_dir, add_dist=False)
+labels_vol = ["Left-Thalamus-Proper", "Right-Thalamus-Proper", "Brain-Stem"]
+vol_src = mne.setup_volume_source_space(subject, mri=mri, pos=5.0, subjects_dir=subjects_dir, volume_label=None)
+src = surf_src + vol_src
+
+tmin, tmax = -0.002, 0.015
+rejthresh = 100e-6  # Because of high-pass but using median
+epochs = mne.Epochs(raw, eves, [3, 9, 48, 144], tmin=tmin, proj=False, tmax=tmax, baseline=(-0.002, 0.0016),reject=dict(eeg=rejthresh))
+evoked=epochs.average()
+
+fwd_surf = mne.make_forward_solution(raw.info, trans=trans, src=surf_src, bem=bem, meg=False, eeg=True)
+noise_cov = mne.compute_covariance(epochs, method='auto')
+loose_mix = 0.2
+inverse_operator = mne.minimum_norm.make_inverse_operator(raw.info, fwd_surf, noise_cov, loose=loose_mix, depth=0.8)
+stc_surf = mne.minimum_norm.apply_inverse(evoked, inverse_operator, lambda2=1/9, method='dSPM')
+
+fwd_vol = mne.make_forward_solution(raw.info, trans=trans, src=vol_src, bem=bem, meg=False, eeg=True)
+noise_cov = mne.compute_covariance(epochs, method='auto')
+loose_mix = 1.0
+inverse_operator = mne.minimum_norm.make_inverse_operator(raw.info, fwd_vol, noise_cov, loose=loose_mix, depth=0.8)
+stc_vol = mne.minimum_norm.apply_inverse(evoked, inverse_operator, lambda2=1/9, method='dSPM')
+
+labels = mne.read_labels_from_annot(subject, parc="aparc", subjects_dir=subjects_dir)
+auditory_labels = ["transversetemporal-lh", "transversetemporal-rh"]
+auditory_tc = [stc_surf.extract_label_time_course(label, surf_src, mode='max') for label in labels if label.name in auditory_labels]
+
+
+
+brainstem_label = mne.get_volume_labels_from_aseg(mri)
+if 'Brain-Stem' in brainstem_label:
+    brainstem_idx = brainstem_label.index("Brain-Stem")
+    brainstem_tc = stc_vol.data[brainstem_idx, :]
+else:
+    brainstem_tc = None
+
+times = stc_surf.times
+plt.figure(figsize=(10, 5))
+plt.plot(times, auditory_tc[0].T, label="Left A1", color='blue')
+plt.plot(times, auditory_tc[1].T, label="Right A1", color='cyan')
+plt.plot(times, brainstem_tc, label="Brainstem", color='green')
+plt.plot(times, y*1e7, label="Raw ABR", color='black')
+
+plt.xlabel("Time (s)")
+plt.ylabel("Source Voltage (a.u.)")
+plt.title("Time Course of Primary Auditory Cortex (Surf) and Brainstem (Vol)")
+plt.legend()
+plt.show()
